@@ -208,7 +208,7 @@ internal class RoliaScan(context: MangaLoaderContext) :
 				break
 			}
 		}
-		return result
+		return result.reversed()
 	}
 
 	private fun buildChapterUrl(

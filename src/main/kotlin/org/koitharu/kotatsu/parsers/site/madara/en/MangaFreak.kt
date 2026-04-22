@@ -30,18 +30,11 @@ internal class MangaFreak(context: MangaLoaderContext) :
 		get() = MangaListFilterCapabilities(
 			isSearchSupported = true,
 			isSearchWithFiltersSupported = true,
-			isMultipleTagsSupported = true,
-			isTagsExclusionSupported = true,
+			isMultipleTagsSupported = false,
+			isTagsExclusionSupported = false,
 		)
 
 	override suspend fun getFilterOptions() = MangaListFilterOptions(
-		availableTags = GENRES.mapToSet { (key, title) ->
-			MangaTag(
-				key = key,
-				title = title,
-				source = source,
-			)
-		},
 		availableStates = EnumSet.of(MangaState.FINISHED, MangaState.ONGOING),
 		availableContentTypes = EnumSet.of(ContentType.MANGA, ContentType.MANHWA),
 	)

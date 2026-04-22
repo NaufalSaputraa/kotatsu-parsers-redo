@@ -250,6 +250,11 @@ internal class XoManga(context: MangaLoaderContext) :
 	}
 
 	private fun extractSlug(item: JSONObject): String? {
+		val link = item.optString("link").nullIfEmpty()
+		if (!link.isNullOrBlank()) {
+			val idParam = link.substringAfter("id=", "").substringBefore('&').trim()
+			if (idParam.isNotEmpty()) return idParam
+		}
 		val candidates = listOf(
 			item.optString("slug").nullIfEmpty(),
 			item.optString("id").nullIfEmpty(),

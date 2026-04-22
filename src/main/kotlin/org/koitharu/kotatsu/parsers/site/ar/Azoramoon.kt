@@ -124,13 +124,16 @@ internal class Azoramoon(context: MangaLoaderContext) :
 
 			// Parse genres
 			val genresArray = obj.optJSONArray("genres")
+			var isNovel = false
 			val tags = if (genresArray != null) {
 				buildSet {
 					for (idx in 0 until genresArray.length()) {
 						val genre = genresArray.getJSONObject(idx)
+						val genreName = genre.getString("name")
+						if (genreName == "رواية") isNovel = true
 						add(MangaTag(
 							key = genre.getInt("id").toString(),
-							title = genre.getString("name"),
+							title = genreName,
 							source = source,
 						))
 					}
@@ -138,6 +141,10 @@ internal class Azoramoon(context: MangaLoaderContext) :
 			} else {
 				emptySet()
 			}
+
+			if (obj.optString("postType") == "رواية" || obj.optString("type") == "رواية") isNovel = true
+
+			if (isNovel) continue
 
 			result.add(
 				Manga(
@@ -265,6 +272,14 @@ internal class Azoramoon(context: MangaLoaderContext) :
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val doc = webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml()
+
+		if (doc.selectFirst("span.inline-block.border.text-foreground")?.text() == "رواية") {
+			return manga.copy(
+				state = MangaState.FINISHED,
+				chapters = emptyList(),
+			)
+		}
+
 		val chapters = loadChapters(manga, doc)
 
 		val coverUrl = doc.selectFirst("section img")?.src() ?: manga.coverUrl
@@ -395,59 +410,18 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		timeZone = TimeZone.getTimeZone("UTC")
 	}
 
-    override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-        val fullUrl = chapter.url.toAbsoluteUrl(domain)
-        val doc = webClient.httpGet(fullUrl).parseHtml()
+	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
+		val fullUrl = chapter.url.toAbsoluteUrl(domain)
+		val doc = webClient.httpGet(fullUrl).parseHtml()
 
-        val scripts = doc.select("script:containsData(__next_f.push)")
-
-        for (script in scripts) {
-            val scriptContent = script.data()
-
-            if (!scriptContent.contains("\\\"images\\\":")) {
-                continue
-            }
-
-            val imagesMatch = Regex("""\\\"images\\\":\[([\s\S]*?)\],\\\"""").find(scriptContent)
-
-            if (imagesMatch != null) {
-                val escapedImagesJson = "[${imagesMatch.groupValues[1]}]"
-
-                val imagesJson = escapedImagesJson
-                    .replace("\\\\", "\u0000")
-                    .replace("\\\"", "\"")
-                    .replace("\u0000", "\\")
-
-                try {
-                    val imagesArray = JSONArray(imagesJson)
-                    val pages = mutableListOf<MangaPage>()
-
-                    for (i in 0 until imagesArray.length()) {
-                        val imageObj = imagesArray.getJSONObject(i)
-                        val imageUrl = imageObj.optString("url")
-
-                        if (imageUrl.isNotBlank()) {
-                            pages.add(
-                                MangaPage(
-                                    id = generateUid(imageUrl),
-                                    url = imageUrl,
-                                    preview = null,
-                                    source = source,
-                                )
-                            )
-                        }
-                    }
-
-                    if (pages.isNotEmpty()) {
-                        return pages
-                    }
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    continue
-                }
-            }
-        }
-
-        throw Exception("Failed to extract chapter images from page")
-    }
+		return doc.select("section[itemprop=articleBody] figure img").mapNotNull { img ->
+			val imageUrl = img.src()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			MangaPage(
+				id = generateUid(imageUrl),
+				url = imageUrl,
+				preview = null,
+				source = source,
+			)
+		}
+	}
 }

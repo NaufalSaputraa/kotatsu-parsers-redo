@@ -12,7 +12,7 @@ internal class ArvenScans(context: MangaLoaderContext) :
 	MadaraParser(context, MangaParserSource.ARVENSCANS, "arvencomics.com") {
 
 	override val listUrl = "comic/"
-	override val postReq = true
+    override val withoutAjax = true
 
 	override fun intercept(chain: Interceptor.Chain): Response {
 		synchronized(rateLimitLock) {
