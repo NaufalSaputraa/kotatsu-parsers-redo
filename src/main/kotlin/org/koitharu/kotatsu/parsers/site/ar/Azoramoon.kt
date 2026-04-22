@@ -3,13 +3,14 @@ package org.koitharu.kotatsu.parsers.site.ar
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import org.jsoup.parser.Parser
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import org.koitharu.kotatsu.parsers.util.json.toJSONArrayOrNull
+import org.koitharu.kotatsu.parsers.util.json.toJSONObjectOrNull
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -316,25 +317,23 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		val seriesSlug = manga.url.substringAfter("/series/", "").substringBefore('/')
 		if (seriesSlug.isEmpty()) return emptyList()
 
-		val payload = extractNextPushData(doc)
-		val chaptersIndex = payload.indexOf("\"chapters\":[")
-		if (chaptersIndex == -1) return emptyList()
-
-		val arrayStart = payload.indexOf('[', chaptersIndex)
-		if (arrayStart == -1) return emptyList()
-
-		val arrayEnd = findMatchingBracket(payload, arrayStart, '[', ']')
-		if (arrayEnd == -1) return emptyList()
-
-		val chaptersJson = payload.substring(arrayStart, arrayEnd + 1).toJSONArrayOrNull() ?: return emptyList()
+		val chaptersJson = extractChaptersFromAstroProps(doc) ?: return emptyList()
 
 		val chapters = ArrayList<MangaChapter>(chaptersJson.length())
 		for (i in 0 until chaptersJson.length()) {
-			val chapter = chaptersJson.optJSONObject(i) ?: continue
-			val slug = chapter.optString("slug").takeUnless { it.isBlank() } ?: continue
+			val chapter = unboxSerializedValue(chaptersJson.opt(i)) as? JSONObject ?: continue
+			val slug = (unboxSerializedValue(chapter.opt("slug")) as? String)
+				?.takeUnless { it.isBlank() || it == "null" }
+				?: continue
 			val url = "/series/$seriesSlug/$slug"
-			val number = chapter.optDouble("number").takeIf { it > 0.0 }?.toFloat() ?: 0f
-			val title = chapter.optString("title").takeUnless { it.isBlank() || it == "null" }
+			val number = when (val rawNumber = unboxSerializedValue(chapter.opt("number"))) {
+				is Number -> rawNumber.toFloat()
+				is String -> rawNumber.toFloatOrNull() ?: 0f
+				else -> 0f
+			}
+			val title = (unboxSerializedValue(chapter.opt("title")) as? String)
+				?.takeUnless { it.isBlank() || it == "null" }
+			val createdAt = unboxSerializedValue(chapter.opt("createdAt")) as? String
 
 			chapters += MangaChapter(
 				id = generateUid(url),
@@ -348,7 +347,7 @@ internal class Azoramoon(context: MangaLoaderContext) :
 				volume = 0,
 				url = url,
 				scanlator = null,
-				uploadDate = parseChapterDate(chapter.optString("createdAt")),
+				uploadDate = parseChapterDate(createdAt),
 				branch = null,
 				source = source,
 			)
@@ -356,39 +355,27 @@ internal class Azoramoon(context: MangaLoaderContext) :
 		return chapters.sortedBy { it.number }
 	}
 
-	private fun extractNextPushData(doc: Document): String {
-		val sb = StringBuilder()
-		for (script in doc.select("script")) {
-			val raw = script.data().substringBetween("self.__next_f.push(", ")", "").trim()
-			if (raw.isEmpty()) continue
+	private fun extractChaptersFromAstroProps(doc: Document): JSONArray? {
+		val propsEscaped = doc
+			.selectFirst("section[data-series-tab-panel=chapters] astro-island[props]")
+			?.attr("props")
+			?.takeUnless { it.isBlank() }
+			?: return null
 
-			val payload = raw.toJSONArrayOrNull() ?: continue
-			for (i in 0 until payload.length()) {
-				(payload.opt(i) as? String)?.let(sb::append)
-			}
-		}
-		return sb.toString()
+		val props = Parser.unescapeEntities(propsEscaped, false)
+		val root = props.toJSONObjectOrNull() ?: return null
+		val post = unboxSerializedValue(root.opt("post")) as? JSONObject ?: return null
+		return unboxSerializedValue(post.opt("chapters")) as? JSONArray
 	}
 
-	private fun findMatchingBracket(text: String, startIndex: Int, openChar: Char, closeChar: Char): Int {
-		var depth = 0
-		var inString = false
-		var escaped = false
-
-		for (i in startIndex until text.length) {
-			val char = text[i]
-			when {
-				escaped -> escaped = false
-				char == '\\' -> escaped = true
-				char == '"' -> inString = !inString
-				!inString && char == openChar -> depth++
-				!inString && char == closeChar -> {
-					depth--
-					if (depth == 0) return i
-				}
-			}
+	private fun unboxSerializedValue(value: Any?): Any? {
+		if (value !is JSONArray || value.length() != 2) {
+			return value
 		}
-		return -1
+		return when (value.opt(0)) {
+			0, 1, "0", "1" -> unboxSerializedValue(value.opt(1))
+			else -> value
+		}
 	}
 
 	private fun formatChapterNumber(number: Float): String {
