@@ -80,7 +80,18 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		if (request.url.isImageUrl()) {
 			builder.header("Accept", IMAGE_ACCEPT)
 		}
-		return chain.proceed(builder.build())
+		val updatedRequest = builder.build()
+		val response = chain.proceed(updatedRequest)
+		val fallbackUrl = updatedRequest.url.toFallbackChapterImageUrl()
+		if (response.isSuccessful || fallbackUrl == null) {
+			return response
+		}
+		response.close()
+		return chain.proceed(
+			updatedRequest.newBuilder()
+				.url(fallbackUrl)
+				.build(),
+		)
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = filterOptions.get()
@@ -413,9 +424,27 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		return when {
 			host == domain && encodedPath == "/_next/image" -> true
 			host == domain && encodedPath.startsWith("/uploads/titles/") -> true
+			host == domain && encodedPath.startsWith("/uploads/chapters/") -> true
 			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> true
 			else -> false
 		}
+	}
+
+	private fun HttpUrl.toFallbackChapterImageUrl(): HttpUrl? {
+		if (host != domain || !encodedPath.startsWith("/uploads/titles/")) {
+			return null
+		}
+		val segments = encodedPath.trim('/').split('/')
+		val chaptersIndex = segments.indexOf("chapters")
+		if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) {
+			return null
+		}
+		val chapterId = segments[chaptersIndex + 1]
+		val pageName = segments.last()
+		return newBuilder()
+			.encodedPath("/uploads/chapters/$chapterId/$pageName")
+			.query(null)
+			.build()
 	}
 
 	private fun apiUrl(path: String) = "https://$domain/api/$path".toHttpUrl()

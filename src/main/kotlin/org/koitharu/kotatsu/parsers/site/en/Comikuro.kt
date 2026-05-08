@@ -256,16 +256,12 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 
 	private suspend fun loadRenderedDocument(url: String, readySelector: String): Document {
 		val script = """
-			(() => new Promise((resolve) => {
-				let resolved = false;
-				const finish = () => {
-					if (resolved) return;
-					resolved = true;
-					resolve(document.documentElement.outerHTML);
-				};
+			(() => {
+				const root = document.documentElement;
+				const html = (root && root.outerHTML) || '';
+				const text = ((document.body && document.body.innerText) || (root && root.innerText) || '');
+				const lower = (document.title + '\n' + text + '\n' + html).toLowerCase();
 				const challengeDetected = () => {
-					const root = document.documentElement;
-					const lower = (((root && root.innerText) || '') + '\n' + ((root && root.outerHTML) || '')).toLowerCase();
 					return document.querySelector('script[src*="challenge-platform"]') !== null ||
 						document.querySelector('script[src*="turnstile"]') !== null ||
 						document.querySelector('iframe[src*="challenges.cloudflare.com"]') !== null ||
@@ -284,42 +280,21 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 						lower.includes('turnstile') ||
 						lower.includes('cf-chl-opt');
 				};
-				const ready = () => document.querySelector('$readySelector') !== null;
-				const startedAt = Date.now();
-				let readySince = 0;
-				const tick = () => {
-					if (challengeDetected()) {
-						finish();
-						return;
-					}
-					if (ready()) {
-						if (!readySince) readySince = Date.now();
-						if (Date.now() - readySince > 9000) {
-							finish();
-							return;
-						}
-					}
-					if (Date.now() - startedAt > 18000) {
-						finish();
-						return;
-					}
-					setTimeout(tick, 250);
-				};
-				if (document.readyState === 'complete' || document.readyState === 'interactive') {
-					tick();
-				} else {
-					window.addEventListener('load', tick, { once: true });
-					setTimeout(tick, 2000);
+				if (challengeDetected()) {
+					return "CLOUDFLARE_BLOCKED";
 				}
-				setTimeout(finish, 15000);
-			}))();
+				if (document.querySelector('$readySelector') !== null) {
+					return html;
+				}
+				return null;
+			})();
 		""".trimIndent()
-		val rawHtml = context.evaluateJs(url, script, 30000L).orEmpty().decodeWebViewString()
-		logReturnedPageContent(url, rawHtml)
-		if (isCloudflareChallengePage(rawHtml)) {
+		val rawResult = context.evaluateJs(url, script, 30000L).orEmpty().decodeWebViewString()
+		logReturnedPageContent(url, rawResult)
+		if (rawResult == CLOUDFLARE_BLOCKED || isCloudflareChallengePage(rawResult)) {
 			requestCloudflareVerification(url)
 		}
-		return Jsoup.parse(rawHtml, url)
+		return Jsoup.parse(rawResult, url)
 	}
 
 	private fun logReturnedPageContent(url: String, html: String) {
@@ -415,12 +390,17 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 			.replace("\\n", "\n")
 			.replace("\\r", "\r")
 			.replace("\\t", "\t")
+			.replace(unicodeEscapeRegex) { match ->
+				match.groupValues[1].toInt(16).toChar().toString()
+			}
 	}
 
 	private companion object {
 
 		const val cloudflareMessage =
 			"Cloudflare verification is required. Open the source in the in-app browser, complete the check, then try again."
+
+		const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
 
 		const val LOG_CHUNK_SIZE = 3500
 
@@ -430,6 +410,8 @@ internal class Comikuro(context: MangaLoaderContext) : PagedMangaParser(context,
 		)
 
 		val chapterNumberRegex = Regex("""(?:chapter|ch\.?)\s*([0-9]+(?:\.[0-9]+)?)""", RegexOption.IGNORE_CASE)
+
+		val unicodeEscapeRegex = Regex("""\\u([0-9A-Fa-f]{4})""")
 
 		val genres = setOf(
 			"action" to "Action",
