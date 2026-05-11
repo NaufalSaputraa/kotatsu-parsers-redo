@@ -1,18 +1,19 @@
 package org.koitharu.kotatsu.parsers.site.en
 
-import java.util.Base64
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
 import org.koitharu.kotatsu.parsers.config.ConfigKey
 import org.koitharu.kotatsu.parsers.core.PagedMangaParser
+import org.koitharu.kotatsu.parsers.exception.ParseException
 import org.koitharu.kotatsu.parsers.model.*
 import org.koitharu.kotatsu.parsers.util.*
-import java.net.URLEncoder
+import org.koitharu.kotatsu.parsers.webview.InterceptionConfig
 import java.util.*
 
 @MangaSourceParser("COMIX", "Comix", "en", ContentType.MANGA)
@@ -20,6 +21,12 @@ internal class Comix(context: MangaLoaderContext) :
     PagedMangaParser(context, MangaParserSource.COMIX, 28) {
 
     override val configKeyDomain = ConfigKey.Domain("comix.to")
+
+    override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
+        super.onCreateConfig(keys)
+        keys.add(userAgentKey)
+        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+    }
 
     override val filterCapabilities: MangaListFilterCapabilities
         get() = MangaListFilterCapabilities(
@@ -232,9 +239,15 @@ internal class Comix(context: MangaLoaderContext) :
 
     override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
         val chapterId = chapter.url.substringAfterLast("/").substringBefore("-")
-        val path = "/chapters/$chapterId"
-        val chapterUrl = "${apiUrl(path)}?_=${ComixHash.generateHash(path)}"
-        val response = webClient.httpGet(chapterUrl).parseJson()
+        val apiRequestUrl = interceptApiRequest(
+            pageUrl = chapter.url.toAbsoluteUrl(domain),
+            urlPattern = Regex(
+                "^https?://${Regex.escape(domain)}/api/v1/chapters/${Regex.escape(chapterId)}(?:[/?].*)?$",
+                RegexOption.IGNORE_CASE,
+            ),
+            errorMessage = "Failed to intercept Comix chapter pages request",
+        )
+        val response = webClient.httpGet(apiRequestUrl, getRequestHeaders()).parseJson()
         val pages = response.optJSONObject("result")?.optJSONArray("pages") ?: JSONArray()
 
         return (0 until pages.length()).map { i ->
@@ -251,14 +264,21 @@ internal class Comix(context: MangaLoaderContext) :
     private suspend fun getChapters(manga: Manga): List<MangaChapter> {
         val hashId = manga.url.substringAfter("/title/")
         val allChapters = mutableListOf<JSONObject>()
+        val chaptersPath = "/manga/$hashId/chapters"
+        val firstChaptersUrl = interceptApiRequest(
+            pageUrl = "https://$domain/title/$hashId",
+            urlPattern = Regex(
+                "^https?://${Regex.escape(domain)}/api/v1${Regex.escape(chaptersPath)}(?:[/?].*)?$",
+                RegexOption.IGNORE_CASE,
+            ),
+            errorMessage = "Failed to intercept Comix chapters request",
+        )
         var page = 1
 
         // Fetch all chapters with pagination
         while (true) {
-            val chaptersPath = "/manga/$hashId/chapters"
-            val hashToken = ComixHash.generateHash(chaptersPath)
-            val chaptersUrl = "${apiUrl(chaptersPath)}?order[number]=desc&limit=100&page=$page&_=$hashToken"
-            val response = webClient.httpGet(chaptersUrl).parseJson()
+            val chaptersUrl = firstChaptersUrl.withPageQuery(page)
+            val response = webClient.httpGet(chaptersUrl, getRequestHeaders()).parseJson()
             val result = response.getJSONObject("result")
             val items = result.getJSONArray("items")
 
@@ -339,6 +359,54 @@ internal class Comix(context: MangaLoaderContext) :
 
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
+    private suspend fun interceptApiRequest(
+        pageUrl: String,
+        urlPattern: Regex,
+        errorMessage: String,
+    ): String {
+        val config = InterceptionConfig(
+            timeoutMs = WEBVIEW_INTERCEPT_TIMEOUT,
+            maxRequests = 1,
+            urlPattern = urlPattern,
+        )
+        val requests = runCatching {
+            context.interceptWebViewRequests(pageUrl, config)
+        }.getOrElse { e ->
+            if (isCloudflareError(e)) {
+                requestCloudflareVerification(pageUrl, e)
+            }
+            throw ParseException(errorMessage, pageUrl, e)
+        }
+        val request = requests.firstOrNull { it.urlMatches(urlPattern) }
+        if (request == null) {
+            requestCloudflareVerification(pageUrl)
+        }
+        return request.url
+    }
+
+    private fun requestCloudflareVerification(url: String, cause: Throwable? = null): Nothing {
+        try {
+            context.requestBrowserAction(this, url)
+        } catch (e: UnsupportedOperationException) {
+            throw ParseException(CLOUDFLARE_MESSAGE, url, cause ?: e)
+        }
+    }
+
+    private fun isCloudflareError(error: Throwable): Boolean {
+        val message = error.message?.lowercase(Locale.US).orEmpty()
+        return message.contains("cloudflare") ||
+            message.contains("challenge") ||
+            message.contains("captcha") ||
+            message.contains("browser")
+    }
+
+    private fun String.withPageQuery(page: Int): String {
+        return toHttpUrl().newBuilder()
+            .setQueryParameter("page", page.toString())
+            .build()
+            .toString()
+    }
+
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
         val tags = LinkedHashSet<MangaTag>()
         for (key in TERM_KEYS) {
@@ -395,183 +463,7 @@ internal class Comix(context: MangaLoaderContext) :
         private val NSFW_RATINGS = setOf("erotica", "pornographic")
         private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
         private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
-    }
-}
-
-private object ComixHash {
-    private val KEYS = arrayOf(
-        "JxTcdyiA5GZxnbrmthXBQfU2IMTKcY1+3nNhbq98Sgo=",
-        "3PordjODbhqla382Cxapmo/1JiABJQcjiJj1+48gTJ4=",
-        "OaKvnI5ARA==",
-        "MHNBHYWA7lvy867fXgvGcJwWDk79KqUJUVFsh3RwnnI=",
-        "8i0Cru/VJBSVB2Y1GcMDVpzx2WepOcfnWdd81yxICl4=",
-        "Fyskubz8VvA=",
-        "B46L1x+UeWP+19cRpQ+OZvdLAK9EHID8g3mSgn57tew=",
-        "DTSTmUt6LpDUw9r1lSQqyb3YlFTzruT8tk8wUGkwehQ=",
-        "vY/meeI=",
-        "7xWfIF5THL5LAnRgAARg+4mjWHPU9n3PQwvzbaMNi+Q=",
-        "bewtiTuV+HJk56xxkf2iCljLgruCpBmN9BgE8i6gc9M=",
-        "/Xcb2zAu8AU=",
-        "WgeCQ3T8R51uTwVSiVa7Zy0dN6JOg6Z5JleMS+HV8Aw=",
-        "yXayUVFrrcW56jQCEfZzuCidjpnWKjTDUNT7XeX9i7k=",
-        "tSLco2w=",
-    )
-
-    private fun getKeyBytes(index: Int): IntArray {
-        val b64 = KEYS.getOrNull(index) ?: return IntArray(0)
-        return try {
-            Base64.getDecoder().decode(b64)
-                .map { (it.toInt() and 0xFF) }
-                .toIntArray()
-        } catch (_: Exception) {
-            IntArray(0)
-        }
-    }
-
-    private fun rc4(key: IntArray, data: IntArray): IntArray {
-        if (key.isEmpty()) return data
-        val s = IntArray(256) { it }
-        var j = 0
-        for (i in 0 until 256) {
-            j = (j + s[i] + key[i % key.size]) % 256
-            val temp = s[i]
-            s[i] = s[j]
-            s[j] = temp
-        }
-        var i = 0
-        j = 0
-        val out = IntArray(data.size)
-        for (k in data.indices) {
-            i = (i + 1) % 256
-            j = (j + s[i]) % 256
-            val temp = s[i]
-            s[i] = s[j]
-            s[j] = temp
-            out[k] = data[k] xor s[(s[i] + s[j]) % 256]
-        }
-        return out
-    }
-
-    private fun getMutKey(mk: IntArray, idx: Int): Int =
-        if (mk.isNotEmpty() && (idx % 32) < mk.size) mk[idx % 32] else 0
-
-    private fun opShiftRight7Left1(e: Int): Int = ((e ushr 7) or (e shl 1)) and 255
-    private fun opShiftLeft1Right7(e: Int): Int = ((e shl 1) or (e ushr 7)) and 255
-    private fun opShiftRight2Left6(e: Int): Int = ((e ushr 2) or (e shl 6)) and 255
-    private fun opShiftLeft4Right4(e: Int): Int = ((e shl 4) or (e ushr 4)) and 255
-    private fun opShiftRight4Left4(e: Int): Int = ((e ushr 4) or (e shl 4)) and 255
-
-    private fun mutate(data: IntArray, mutKey: IntArray, prefKey: IntArray, prefKeyLimit: Int, round: Int): IntArray {
-        val out = mutableListOf<Int>()
-        for (i in data.indices) {
-            if (i < prefKeyLimit && i < prefKey.size) out.add(prefKey[i])
-            var v = data[i] xor getMutKey(mutKey, i)
-            v = when (round) {
-                1 -> when (i % 10) {
-                    0 -> opShiftRight7Left1(v)
-                    1 -> v xor 37
-                    2 -> v xor 81
-                    3 -> v xor 147
-                    4 -> opShiftRight2Left6(v)
-                    5, 8 -> opShiftRight4Left4(v)
-                    6 -> v xor 218
-                    7 -> (v + 159) and 255
-                    9 -> v xor 180
-                    else -> v
-                }
-                2 -> when (i % 10) {
-                    0, 9 -> v xor 180
-                    1 -> opShiftLeft1Right7(v)
-                    2 -> v xor 147
-                    3 -> opShiftRight7Left1(v)
-                    4 -> opShiftRight2Left6(v)
-                    5 -> opShiftRight4Left4(v)
-                    6, 8 -> (v + 159) and 255
-                    7 -> (v + 34) and 255
-                    else -> v
-                }
-                3 -> when (i % 10) {
-                    0 -> v xor 81
-                    1 -> opShiftRight4Left4(v)
-                    2, 9 -> opShiftLeft4Right4(v)
-                    3 -> v xor 37
-                    4 -> (v + 159) and 255
-                    5 -> opShiftLeft1Right7(v)
-                    6 -> v xor 180
-                    7 -> (v + 34) and 255
-                    8 -> opShiftRight2Left6(v)
-                    else -> v
-                }
-                4 -> when (i % 10) {
-                    0, 7 -> v xor 218
-                    1, 4 -> opShiftLeft1Right7(v)
-                    2 -> opShiftRight7Left1(v)
-                    3 -> (v + 159) and 255
-                    5, 8 -> v xor 180
-                    6 -> v xor 147
-                    9 -> v xor 37
-                    else -> v
-                }
-                5 -> when (i % 10) {
-                    0 -> opShiftLeft4Right4(v)
-                    1, 3 -> v xor 147
-                    2 -> (v + 34) and 255
-                    4, 9 -> v xor 218
-                    5, 7 -> opShiftLeft1Right7(v)
-                    6 -> v xor 180
-                    8 -> opShiftRight2Left6(v)
-                    else -> v
-                }
-                else -> v
-            }
-            out.add(v and 255)
-        }
-        return out.toIntArray()
-    }
-
-    private fun round1(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(1), getKeyBytes(2), 7, 1)
-        return rc4(getKeyBytes(0), mut)
-    }
-
-    private fun round2(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(4), getKeyBytes(5), 8, 2)
-        return rc4(getKeyBytes(3), mut)
-    }
-
-    private fun round3(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(7), getKeyBytes(8), 5, 3)
-        return rc4(getKeyBytes(6), mut)
-    }
-
-    private fun round4(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(10), getKeyBytes(11), 8, 4)
-        return rc4(getKeyBytes(9), mut)
-    }
-
-    private fun round5(data: IntArray): IntArray {
-        val mut = mutate(data, getKeyBytes(13), getKeyBytes(14), 5, 5)
-        return rc4(getKeyBytes(12), mut)
-    }
-
-    fun generateHash(path: String): String {
-        val encoded = URLEncoder.encode(path, "UTF-8")
-            .replace("+", "%20")
-            .replace("*", "%2A")
-            .replace("%7E", "~")
-
-        val initialBytes = encoded.toByteArray(Charsets.US_ASCII)
-            .map { it.toInt() and 0xFF }
-            .toIntArray()
-
-        val r1 = round1(initialBytes)
-        val r2 = round2(r1)
-        val r3 = round3(r2)
-        val r4 = round4(r3)
-        val r5 = round5(r4)
-
-        val finalBytes = ByteArray(r5.size) { r5[it].toByte() }
-
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(finalBytes)
+        private const val WEBVIEW_INTERCEPT_TIMEOUT = 30000L
+        private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
     }
 }
