@@ -3,7 +3,6 @@ package org.koitharu.kotatsu.parsers.site.en
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import okhttp3.Headers
-import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -400,12 +399,14 @@ internal class Comix(context: MangaLoaderContext) :
             message.contains("browser")
     }
 
-    private fun String.withPageQuery(page: Int): String {
-        return toHttpUrl().newBuilder()
-            .setQueryParameter("page", page.toString())
-            .build()
-            .toString()
-    }
+	private fun String.withPageQuery(page: Int): String {
+		return if (PAGE_QUERY_REGEX.containsMatchIn(this)) {
+			replace(PAGE_QUERY_REGEX, "$1$page")
+		} else {
+			val separator = if ('?' in this) "&" else "?"
+			"$this${separator}page=$page"
+		}
+	}
 
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
         val tags = LinkedHashSet<MangaTag>()
@@ -461,9 +462,10 @@ internal class Comix(context: MangaLoaderContext) :
 
     private companion object {
         private val NSFW_RATINGS = setOf("erotica", "pornographic")
-        private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
-        private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
-        private const val WEBVIEW_INTERCEPT_TIMEOUT = 30000L
-        private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
-    }
+		private val TERM_KEYS = arrayOf("genres", "genre", "tags", "theme", "demographics", "demographic", "formats")
+		private val RELATIVE_DATE_REGEX = Regex("""^(\d+)\s*(s|m|h|d|w|mo|mos|y|yr|yrs|min|mins|sec|secs|hr|hrs|day|days|week|weeks|month|months|year|years)$""")
+		private val PAGE_QUERY_REGEX = Regex("""([?&]page=)\d+""")
+		private const val WEBVIEW_INTERCEPT_TIMEOUT = 30000L
+		private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
+	}
 }
