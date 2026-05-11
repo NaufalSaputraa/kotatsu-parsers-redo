@@ -315,15 +315,19 @@ internal class Comix(context: MangaLoaderContext) :
     private fun apiUrl(path: String): String = "https://$domain/api/v1/${path.removePrefix("/")}"
 
     private suspend fun webViewApiJson(apiPath: String): JSONObject {
+        logDebug("webViewApiJson start path=$apiPath")
         return evaluateWebViewJson(
-            buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
+            label = apiPath,
+            script = buildWebViewApiScript("return JSON.stringify(await fetchProtected(${apiPath.toJsString()}));"),
         )
     }
 
     private suspend fun webViewChapterList(hashId: String): JSONArray {
         val pathPrefix = "/api/v1/manga/$hashId/chapters?order%5Bnumber%5D=desc&limit=100&page="
+        logDebug("webViewChapterList start hashId=$hashId prefix=$pathPrefix")
         val json = evaluateWebViewJson(
-            buildWebViewApiScript(
+            label = "chapters:$hashId",
+            script = buildWebViewApiScript(
                 """
                     const all = [];
                     let page = 1;
@@ -342,27 +346,37 @@ internal class Comix(context: MangaLoaderContext) :
                         if (!items.length || currentPage >= lastPage) break;
                         page++;
                     }
-                    return JSON.stringify({ items: all });
+                    return JSON.stringify({ items: all, debug: { pages: page, count: all.length } });
                 """.trimIndent(),
             ),
         )
-        return json.optJSONArray("items") ?: JSONArray()
+        val items = json.optJSONArray("items") ?: JSONArray()
+        logDebug("webViewChapterList done hashId=$hashId count=${items.length()} debug=${json.optJSONObject("debug")}")
+        return items
     }
 
-    private suspend fun evaluateWebViewJson(script: String): JSONObject {
+    private suspend fun evaluateWebViewJson(label: String, script: String): JSONObject {
+        logDebug("evaluateWebViewJson load base=https://$domain/ label=$label scriptLen=${script.length}")
         val raw = context.evaluateJs("https://$domain/", script, WEBVIEW_API_TIMEOUT)
-            .orEmpty()
+        logDebug("evaluateWebViewJson raw label=$label len=${raw?.length ?: 0} excerpt=${raw.orEmpty().take(LOG_EXCERPT)}")
+        val decoded = raw.orEmpty()
             .decodeWebViewString()
-        if (raw == CLOUDFLARE_BLOCKED || isCloudflarePage(raw)) {
+        logDebug("evaluateWebViewJson decoded label=$label len=${decoded.length} excerpt=${decoded.take(LOG_EXCERPT)}")
+        if (decoded == CLOUDFLARE_BLOCKED || isCloudflarePage(decoded)) {
+            logDebug("evaluateWebViewJson cloudflare label=$label")
             requestCloudflareVerification("https://$domain/")
         }
-        if (raw.isBlank()) {
+        if (decoded.isBlank()) {
+            logDebug("evaluateWebViewJson blank label=$label")
             throw ParseException("Comix WebView API returned an empty response", "https://$domain/")
         }
-        val json = runCatching { JSONObject(raw) }.getOrElse { e ->
-            throw ParseException("Comix WebView API returned invalid JSON: ${raw.take(200)}", "https://$domain/", e)
+        val json = runCatching { JSONObject(decoded) }.getOrElse { e ->
+            logDebug("evaluateWebViewJson invalid json label=$label")
+            throw ParseException("Comix WebView API returned invalid JSON: ${decoded.take(200)}", "https://$domain/", e)
         }
+        logDebug("evaluateWebViewJson json label=$label keys=${json.keys().asSequence().joinToString(",")}")
         json.optString("error").nullIfEmpty()?.let { error ->
+            logDebug("evaluateWebViewJson error label=$label error=$error")
             throw ParseException("Comix WebView API failed: $error", "https://$domain/")
         }
         return json
@@ -537,6 +551,10 @@ internal class Comix(context: MangaLoaderContext) :
             lower.contains("turnstile")
     }
 
+    private fun logDebug(message: String) {
+        println("COMIX_DEBUG: $message")
+    }
+
     private fun parseTerms(json: JSONObject): Set<MangaTag> {
         val tags = LinkedHashSet<MangaTag>()
         for (key in TERM_KEYS) {
@@ -604,6 +622,7 @@ internal class Comix(context: MangaLoaderContext) :
         private val UNICODE_ESCAPE_REGEX = Regex("""\\u([0-9A-Fa-f]{4})""")
         private const val WEBVIEW_API_TIMEOUT = 45000L
         private const val MAX_CHAPTER_API_PAGES = 50
+        private const val LOG_EXCERPT = 500
         private const val CLOUDFLARE_BLOCKED = "CLOUDFLARE_BLOCKED"
         private const val CLOUDFLARE_MESSAGE = "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
     }
