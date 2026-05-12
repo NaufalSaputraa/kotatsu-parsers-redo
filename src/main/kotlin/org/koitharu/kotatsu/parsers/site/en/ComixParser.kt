@@ -26,7 +26,7 @@ internal class Comix(context: MangaLoaderContext) :
     override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
         super.onCreateConfig(keys)
         keys.add(userAgentKey)
-        keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
+        keys.add(ConfigKey.DisableUpdateChecking(defaultValue = true))
     }
 
     override val filterCapabilities: MangaListFilterCapabilities
