@@ -332,8 +332,9 @@ internal abstract class MadthemeParser(
 		return when {
 			value.startsWith("https://") || value.startsWith("http://") -> value
 			value.startsWith("//") -> "https:$value"
+			value.contains("/manga/") && !value.contains("/wp-content/") ->
+				"https://$IMAGE_FALLBACK_HOST/manga${value.substringAfter("/manga")}"
 			value.startsWith("/") -> "https://$domain$value"
-			value.contains("/manga/") -> "https://$IMAGE_FALLBACK_HOST/manga${value.substringAfter("/manga")}"
 			else -> value.toAbsoluteUrl(domain)
 		}
 	}
