@@ -1,5 +1,6 @@
 package org.koitharu.kotatsu.parsers.site.mangotheme
 
+import okhttp3.Headers
 import org.json.JSONArray
 import org.json.JSONObject
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
@@ -68,6 +69,8 @@ internal abstract class MangoThemeParser(
 		.add("Referer", "https://$domain/")
 		.add("Accept-Language", "pt-BR, pt;q=0.9, en-US;q=0.8, en;q=0.7")
 		.build()
+
+	protected open fun getApiRequestHeaders(): Headers = getRequestHeaders()
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
 		availableTags = availableTagsSet,
@@ -271,7 +274,7 @@ internal abstract class MangoThemeParser(
 	}
 
 	private suspend fun requestJson(url: String): JSONObject {
-		return webClient.httpGet(url, getRequestHeaders()).use { response ->
+		return webClient.httpGet(url, getApiRequestHeaders()).use { response ->
 			val body = response.body.string()
 			val parsedBody = if (response.headers["x-encrypted"].toBoolean()) {
 				MangoThemeDecrypt.decrypt(body, encryptionKey)
