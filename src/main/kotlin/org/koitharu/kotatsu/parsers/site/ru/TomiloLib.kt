@@ -3,7 +3,6 @@ package org.koitharu.kotatsu.parsers.site.ru
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.Response
 import org.json.JSONArray
@@ -32,7 +31,6 @@ import org.koitharu.kotatsu.parsers.util.json.getStringOrNull
 import org.koitharu.kotatsu.parsers.util.parseJson
 import org.koitharu.kotatsu.parsers.util.parseSafe
 import org.koitharu.kotatsu.parsers.util.toAbsoluteUrl
-import org.koitharu.kotatsu.parsers.util.toRelativeUrl
 import org.koitharu.kotatsu.parsers.util.suspendlazy.suspendLazy
 import java.text.SimpleDateFormat
 import java.util.EnumSet
@@ -81,43 +79,7 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		if (request.url.isImageUrl()) {
 			builder.header("Accept", IMAGE_ACCEPT)
 		}
-		val updatedRequest = builder.build()
-		val response = chain.proceed(updatedRequest)
-		val fallbackUrl = updatedRequest.url.toFallbackChapterImageUrl()
-			?: updatedRequest.url.toFallbackCoverImageUrl(response.code)
-		if (response.isSuccessful || fallbackUrl == null) {
-			return response
-		}
-		response.close()
-		return chain.proceed(
-			updatedRequest.newBuilder()
-				.url(fallbackUrl)
-				.build(),
-		).let { fallbackResponse ->
-			if (fallbackResponse.isSuccessful) {
-				return fallbackResponse
-			}
-			val coverJpgFallbackUrl = fallbackResponse.request.url.toFallbackCoverImageUrl(fallbackResponse.code)
-			if (coverJpgFallbackUrl != null && coverJpgFallbackUrl != fallbackResponse.request.url) {
-				fallbackResponse.close()
-				return chain.proceed(
-					updatedRequest.newBuilder()
-						.url(coverJpgFallbackUrl)
-						.build(),
-				)
-			}
-			val s3PageFallbackUrl = updatedRequest.url.toFallbackS3ChapterPageUrl(fallbackResponse.code)
-			if (s3PageFallbackUrl == null) {
-				fallbackResponse
-			} else {
-				fallbackResponse.close()
-				chain.proceed(
-					updatedRequest.newBuilder()
-						.url(s3PageFallbackUrl)
-						.build(),
-				)
-			}
-		}
+		return chain.proceed(builder.build())
 	}
 
 	override suspend fun getFilterOptions(): MangaListFilterOptions = filterOptions.get()
@@ -191,10 +153,20 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		val url = chapter.url.toAbsoluteUrl(domain).toHttpUrl()
 		val chapterId = url.pathSegments.lastOrNull()?.takeIf { it.isNotEmpty() }
 			?: throw ParseException("Cannot parse chapter id", chapter.url)
-		val titleId = url.queryParameter("titleId")?.takeIf { it.isNotEmpty() }
-			?: throw ParseException("Cannot parse title id", chapter.url)
-		return fetchS3CoverPages(titleId, chapterId, chapter.url)
-			.ifEmpty { fetchS3ChapterPages(chapterId, chapter.url) }
+		val pages = webClient.httpGet(apiUrl("chapters/$chapterId"), getRequestHeaders())
+			.parseJson()
+			.optJSONObject("data")
+			?.optJSONArray("pages")
+			?: throw ParseException("Cannot parse chapter pages", chapter.url)
+		return (0 until pages.length()).mapNotNull { i ->
+			val path = pages.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
+			MangaPage(
+				id = generateUid("${chapter.url}#$i"),
+				url = path.toCdnUrl(),
+				preview = null,
+				source = source,
+			)
+		}
 	}
 
 	private suspend fun fetchFilterOptions(): MangaListFilterOptions = MangaListFilterOptions(
@@ -238,11 +210,11 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		if (info == null || info.isAdult()) {
 			return null
 		}
-		val id = info.getStringOrNull("_id") ?: return null
+		info.getStringOrNull("_id") ?: return null
 		val slug = info.getStringOrNull("slug") ?: return null
 		val title = info.getStringOrNull("name") ?: slug
 		val url = "/titles/$slug"
-		val cover = resolveS3CoverUrl(id)
+		val cover = info.getStringOrNull("coverImage")?.toCdnUrl()
 		val tags = LinkedHashSet<MangaTag>()
 		info.optJSONArray("genres")?.addStringsTo(tags)
 		info.optJSONArray("tags")?.addStringsTo(tags)
@@ -296,22 +268,6 @@ internal class TomiloLib(context: MangaLoaderContext) :
 				scanlator = null,
 				uploadDate = parseDate(ch.getStringOrNull("releaseDate") ?: ch.getStringOrNull("createdAt")),
 				branch = null,
-				source = source,
-			)
-		}
-	}
-
-	private fun parsePages(pages: JSONArray?, chapterUrl: String, titleId: String): List<MangaPage> {
-		if (pages == null || pages.length() == 0) {
-			return emptyList()
-		}
-		return (0 until pages.length()).mapNotNull { i ->
-			val path = pages.optString(i).takeIf { it.isNotBlank() } ?: return@mapNotNull null
-			val imageUrl = resolvePageUrl(path, titleId)
-			MangaPage(
-				id = generateUid("$chapterUrl#$i"),
-				url = imageUrl,
-				preview = null,
 				source = source,
 			)
 		}
@@ -397,208 +353,21 @@ internal class TomiloLib(context: MangaLoaderContext) :
 		return lowercase(Locale.ROOT) in ADULT_GENRES
 	}
 
-	private fun resolveCoverUrl(path: String): String {
-		return when {
-			path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true) -> path
-			path.startsWith("/uploads/titles/") -> path.toAbsoluteUrl(domain)
-			path.startsWith("/titles/") -> "/uploads$path".toAbsoluteUrl(domain)
-			else -> path.toAbsoluteUrl(domain)
+	/**
+	 * Maps a relative storage path from the API (e.g. `/uploads/titles/{id}/cover.jpg` or
+	 * `/chapters/{id}/001.webp`) to its absolute CDN URL. The API already encodes the correct
+	 * file extension and page names, so no probing is required.
+	 */
+	private fun String.toCdnUrl(): String {
+		if (startsWith("http://", ignoreCase = true) || startsWith("https://", ignoreCase = true)) {
+			return this
 		}
-	}
-
-	private suspend fun fetchS3CoverPages(titleId: String, chapterId: String, chapterUrl: String): List<MangaPage> {
-		val result = ArrayList<MangaPage>()
-		for (page in 1..MAX_S3_COVER_PAGES) {
-			val imageUrl = findFirstExistingUrl(
-				"$CDN_URL/titles/$titleId/chapters/$chapterId/cover_$page.jpeg?w=750&q=85",
-				"$CDN_URL/titles/$titleId/chapters/$chapterId/cover_$page.jpg?w=750&q=85",
-				"$CDN_URL/titles/$titleId/chapters/$chapterId/cover_$page.jpeg",
-				"$CDN_URL/titles/$titleId/chapters/$chapterId/cover_$page.jpg",
-			) ?: break
-			result += MangaPage(
-				id = generateUid("$chapterUrl#s3-cover-$page"),
-				url = imageUrl,
-				preview = null,
-				source = source,
-			)
-		}
-		return result
-	}
-
-	private suspend fun fetchS3ChapterPages(chapterId: String, chapterUrl: String): List<MangaPage> {
-		val result = ArrayList<MangaPage>()
-		for (page in 1..MAX_S3_COVER_PAGES) {
-			val imageUrl = findFirstExistingUrl(
-				"$CDN_URL/chapters/$chapterId/${page.toString().padStart(3, '0')}.jpeg",
-				"$CDN_URL/chapters/$chapterId/${page.toString().padStart(3, '0')}.jpg",
-			) ?: break
-			result += MangaPage(
-				id = generateUid("$chapterUrl#s3-chapter-$page"),
-				url = imageUrl,
-				preview = null,
-				source = source,
-			)
-		}
-		return result
-	}
-
-	private suspend fun findFirstExistingUrl(vararg urls: String): String? {
-		for (url in urls) {
-			val resolvedUrl = runCatching {
-				webClient.httpHead(url).use { response ->
-					response.request.url.toString()
-				}
-			}.getOrNull()
-			if (resolvedUrl != null) {
-				return resolvedUrl
-			}
-		}
-		return null
-	}
-
-	private suspend fun resolveS3CoverUrl(titleId: String): String {
-		return findFirstExistingUrl(
-			"$CDN_URL/titles/$titleId/cover.jpeg",
-			"$CDN_URL/titles/$titleId/cover.jpg",
-		) ?: "$CDN_URL/titles/$titleId/cover.jpeg"
-	}
-
-	private fun resolveNextImageCoverUrl(path: String): String? {
-		val cdnPath = when {
-			path.startsWith("/uploads/titles/") -> path.removePrefix("/uploads")
-			path.startsWith("/titles/") -> path
-			else -> return null
-		}
-		return "https://$domain/_next/image".toHttpUrl().newBuilder()
-			.addQueryParameter("url", "$CDN_URL$cdnPath")
-			.addQueryParameter("w", "640")
-			.addQueryParameter("q", "85")
-			.build()
-			.toString()
-	}
-
-	private fun resolvePageUrl(path: String, titleId: String): String {
-		return (path.toUploadsChapterPath(titleId)?.toAbsoluteUrl(domain)
-			?: path.toAbsoluteUrl(domain)).toRelativeUrl(domain)
-	}
-
-	private fun String.toUploadsChapterPath(titleId: String): String? {
-		val pagePath = if (startsWith("http://", ignoreCase = true) || startsWith("https://", ignoreCase = true)) {
-			toHttpUrl().encodedPath
-		} else {
-			substringBefore('?')
-		}
-		val segments = pagePath.trim('/').split('/')
-		val chaptersIndex = segments.indexOf("chapters")
-		if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) {
-			return null
-		}
-		val chapterId = segments[chaptersIndex + 1]
-		val pageName = segments.last()
-		return "/uploads/titles/$titleId/chapters/$chapterId/$pageName"
+		val path = removePrefix("/uploads").let { if (it.startsWith("/")) it else "/$it" }
+		return "$CDN_URL$path"
 	}
 
 	private fun HttpUrl.isImageUrl(): Boolean {
-		return when {
-			host == domain && encodedPath == "/_next/image" -> true
-			host == domain && encodedPath.startsWith("/uploads/titles/") -> true
-			host == domain && encodedPath.startsWith("/uploads/chapters/") -> true
-			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> true
-			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/chapters/") -> true
-			else -> false
-		}
-	}
-
-	private fun HttpUrl.toFallbackChapterImageUrl(): HttpUrl? {
-		if (host != domain || !encodedPath.startsWith("/uploads/titles/")) {
-			return null
-		}
-		val segments = encodedPath.trim('/').split('/')
-		val chaptersIndex = segments.indexOf("chapters")
-		if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) {
-			return null
-		}
-		val chapterId = segments[chaptersIndex + 1]
-		val pageName = segments.last()
-		return newBuilder()
-			.encodedPath("/uploads/chapters/$chapterId/$pageName")
-			.query(null)
-			.build()
-	}
-
-	private fun HttpUrl.toFallbackS3ChapterPageUrl(responseCode: Int): HttpUrl? {
-		if (responseCode != 403 && responseCode != 404) {
-			return null
-		}
-		val segments = encodedPath.trim('/').split('/')
-		val titleId: String
-		val chapterId: String
-		val pageName: String
-		when {
-			host == domain && encodedPath.startsWith("/uploads/titles/") -> {
-				val chaptersIndex = segments.indexOf("chapters")
-				if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) return null
-				titleId = segments.getOrNull(2) ?: return null
-				chapterId = segments[chaptersIndex + 1]
-				pageName = segments.last()
-			}
-			host == domain && encodedPath.startsWith("/uploads/chapters/") -> {
-				if (segments.size < 4) return null
-				chapterId = segments.getOrNull(2) ?: return null
-				pageName = segments.last()
-				titleId = requestPathTitleId() ?: return null
-			}
-			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> {
-				val chaptersIndex = segments.indexOf("chapters")
-				if (chaptersIndex < 0 || chaptersIndex + 2 >= segments.size) return null
-				titleId = segments.getOrNull(2) ?: return null
-				chapterId = segments[chaptersIndex + 1]
-				pageName = segments.last()
-			}
-			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/chapters/") -> {
-				if (segments.size < 4) return null
-				chapterId = segments.getOrNull(2) ?: return null
-				pageName = segments.last()
-				titleId = requestPathTitleId() ?: return null
-			}
-			else -> return null
-		}
-		val pageNumber = pageName.substringBeforeLast('.')
-			.substringAfterLast('_')
-			.toIntOrNull()
-			?: return null
-		val extension = if (encodedPath.endsWith(".jpeg")) "jpg" else "jpeg"
-		return "$CDN_URL/titles/$titleId/chapters/$chapterId/cover_$pageNumber.$extension?w=750&q=85".toHttpUrl()
-	}
-
-	private fun HttpUrl.requestPathTitleId(): String? {
-		return queryParameter("titleId")?.takeIf { it.isNotEmpty() }
-	}
-
-	private fun HttpUrl.toFallbackCoverImageUrl(responseCode: Int): HttpUrl? {
-		if (responseCode != 403 && responseCode != 404) {
-			return null
-		}
-		val titleId = when {
-			host == domain && encodedPath.startsWith("/uploads/titles/") -> {
-				encodedPath.trim('/').split('/').getOrNull(2)
-			}
-			host == domain && encodedPath == "/_next/image" -> {
-				queryParameter("url")?.toHttpUrlOrNull()?.takeIf {
-					it.host == "s3.regru.cloud" && it.encodedPath.startsWith("/tomilolib/titles/")
-				}?.encodedPath?.trim('/')?.split('/')?.getOrNull(2)
-			}
-			host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/titles/") -> {
-				encodedPath.trim('/').split('/').getOrNull(2)
-			}
-			else -> null
-		}?.takeIf { it.isNotEmpty() } ?: return null
-		val extension = if (host == "s3.regru.cloud" && encodedPath.endsWith("/cover.jpeg")) {
-			"jpg"
-		} else {
-			"jpeg"
-		}
-		return "$CDN_URL/titles/$titleId/cover.$extension".toHttpUrl()
+		return host == "s3.regru.cloud" && encodedPath.startsWith("/tomilolib/")
 	}
 
 	private fun apiUrl(path: String) = "https://$domain/api/$path".toHttpUrl()
@@ -644,7 +413,6 @@ internal class TomiloLib(context: MangaLoaderContext) :
 
 	private companion object {
 		private const val PAGE_SIZE = 24
-		private const val MAX_S3_COVER_PAGES = 300
 		private const val CDN_URL = "https://s3.regru.cloud/tomilolib"
 		private const val IMAGE_ACCEPT = "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
 		private val DATE_PATTERNS = listOf(
