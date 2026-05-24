@@ -16,6 +16,7 @@ internal class ImperiodaBritannia(context: MangaLoaderContext) : MangoThemeParse
 	domain = "imperiodabritannia.net",
 	cdnUrl = "https://cdn.imperiodabritannia.net",
 	encryptionKey = "mangotoons_encryption_key_2025",
+	apiBaseUrl = "https://api.imperiodabritannia.net/api",
 	webMangaPathSegment = "manga",
 	availableTagsSet = linkedSetOf<MangaTag>().apply {
 		addTag("48", "+18")

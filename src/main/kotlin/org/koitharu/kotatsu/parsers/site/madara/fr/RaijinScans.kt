@@ -231,7 +231,9 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	}
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
-		val doc = webClient.httpGet(chapter.url.toAbsoluteUrl(domain)).parseHtml()
+		val chapterUrl = chapter.url.toAbsoluteUrl(domain)
+		val doc = webClient.httpGet(chapterUrl).parseHtml()
+		logChapterHtml(chapterUrl, doc.outerHtml())
 
 		return doc.select(selectPage).map { element ->
 			val encodedUrl = element.attr("data-src")
@@ -243,6 +245,13 @@ internal class RaijinScans(context: MangaLoaderContext) :
 				preview = null,
 				source = source,
 			)
+		}
+	}
+
+	private fun logChapterHtml(url: String, html: String) {
+		println("RAIJIN_DEBUG: chapter html url=$url length=${html.length}")
+		html.chunked(LOG_CHUNK_SIZE).forEachIndexed { index, chunk ->
+			println("RAIJIN_DEBUG: chapter html chunk=${index + 1} $chunk")
 		}
 	}
 
@@ -303,5 +312,9 @@ internal class RaijinScans(context: MangaLoaderContext) :
 
 			else -> parseChapterDate(SimpleDateFormat(datePattern, sourceLocale), date)
 		}
+	}
+
+	private companion object {
+		private const val LOG_CHUNK_SIZE = 3000
 	}
 }

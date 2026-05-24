@@ -38,6 +38,7 @@ internal abstract class MangoThemeParser(
 	domain: String,
 	private val cdnUrl: String,
 	private val encryptionKey: String,
+	private val apiBaseUrl: String? = null,
 	private val webMangaPathSegment: String = "obra",
 	private val latestPageSize: Int = 24,
 	private val searchPageSizeValue: Int = 20,
@@ -91,7 +92,7 @@ internal abstract class MangoThemeParser(
 
 	override suspend fun getDetails(manga: Manga): Manga {
 		val mangaId = manga.url.extractMangaId()
-		val response = requestJson("https://$domain/api/obras/$mangaId")
+		val response = requestJson(apiUrl("obras/$mangaId"))
 		val item = response.optJSONObject("obra")
 			?: response.optJSONObject("data")
 			?: response.optJSONObject("dados")
@@ -113,7 +114,7 @@ internal abstract class MangoThemeParser(
 
 	override suspend fun getPages(chapter: MangaChapter): List<MangaPage> {
 		val response = requestJson(
-			"https://$domain/api/obras/${chapter.url.extractMangaId()}/capitulos/${chapter.url.extractChapterNumber().urlEncoded()}",
+			apiUrl("obras/${chapter.url.extractMangaId()}/capitulos/${chapter.url.extractChapterNumber().urlEncoded()}"),
 		)
 		val item = response.optJSONObject("capitulo")
 			?: response.optJSONObject("data")
@@ -141,14 +142,14 @@ internal abstract class MangoThemeParser(
 
 	private suspend fun getPopularPage(page: Int): List<Manga> {
 		if (page > 1) return emptyList()
-		val response = requestJson("https://$domain/api/obras/top10/views?periodo=total")
+		val response = requestJson(apiUrl("obras/top10/views?periodo=total"))
 		return response.optJSONArray("obras")
 			?.mapJSONNotNull(::parseTopManga)
 			.orEmpty()
 	}
 
 	private suspend fun getLatestPage(page: Int): List<Manga> {
-		val response = requestJson("https://$domain/api/capitulos/recentes?pagina=$page&limite=$latestPageSize")
+		val response = requestJson(apiUrl("capitulos/recentes?pagina=$page&limite=$latestPageSize"))
 		return response.optJSONArray("obras")
 			?.mapJSONNotNull(::parseManga)
 			?.distinctBy { it.url }
@@ -158,7 +159,7 @@ internal abstract class MangoThemeParser(
 	private suspend fun search(page: Int, filter: MangaListFilter): List<Manga> {
 		val limit = if (filter.query.isNullOrEmpty()) latestPageSize else searchPageSizeValue
 		val url = buildString {
-			append("https://").append(domain).append("/api/obras?pagina=").append(page)
+			append(apiUrl("obras?pagina=$page"))
 			append("&limite=").append(limit)
 			filter.query?.trim()?.takeIf { it.isNotEmpty() }?.let {
 				append("&busca=").append(it.urlEncoded())
@@ -283,6 +284,12 @@ internal abstract class MangoThemeParser(
 			}
 			JSONObject(parsedBody)
 		}
+	}
+
+	private fun apiUrl(path: String): String = buildString {
+		append(apiBaseUrl ?: "https://$domain/api")
+		append('/')
+		append(path.removePrefix("/"))
 	}
 
 	private fun String.toAbsoluteCdnUrl(): String = when {
