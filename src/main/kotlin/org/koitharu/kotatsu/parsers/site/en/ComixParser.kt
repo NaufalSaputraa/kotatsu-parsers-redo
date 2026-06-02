@@ -100,8 +100,11 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     override suspend fun getListPage(page: Int, order: SortOrder, filter: MangaListFilter): List<Manga> {
+        // Build a relative API path; the request goes through the WebView bridge
+        // (like details/pages) because /api/v1/manga sits behind a Cloudflare JS
+        // challenge that a plain HTTP GET can't pass.
         val url = buildString {
-            append(apiUrl("manga"))
+            append("/api/v1/manga")
             append("?")
             var firstParam = true
             fun addParam(param: String) {
@@ -151,7 +154,7 @@ internal class Comix(context: MangaLoaderContext) :
             addParam("page=$page")
         }
 
-        val response = webClient.httpGet(url).parseJson()
+        val response = webViewApiJson(url)
         val result = response.getJSONObject("result")
         val items = result.getJSONArray("items")
 
@@ -203,9 +206,9 @@ internal class Comix(context: MangaLoaderContext) :
         val hashId = manga.url.substringAfter("/title/")
         val chaptersDeferred = async { getChapters(manga) }
 
-        // Get detailed manga info
-        val detailUrl = apiUrl("manga/$hashId")
-        val response = webClient.httpGet(detailUrl).parseJson()
+        // Get detailed manga info (through the WebView bridge — the API is
+        // behind a Cloudflare JS challenge that a plain HTTP GET can't pass).
+        val response = webViewApiJson("/api/v1/manga/$hashId")
 
         if (response.has("result")) {
             val result = response.getJSONObject("result")

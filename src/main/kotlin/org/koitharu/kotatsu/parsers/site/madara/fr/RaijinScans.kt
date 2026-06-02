@@ -407,6 +407,6 @@ internal class RaijinScans(context: MangaLoaderContext) :
 	)
 
 	private companion object {
-		private val RJ_PAYLOAD_REGEX = Regex("""\{"m":"[^"]*","c":\{[^}]*}}""")
+		private val RJ_PAYLOAD_REGEX = Regex("""\{"m":"[^"]*","c":\{[^}]*\}\}""")
 	}
 }

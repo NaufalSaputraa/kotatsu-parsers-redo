@@ -17,6 +17,13 @@ internal class Zinmanga(context: MangaLoaderContext) :
 	override val datePattern = "yyyy-MM-dd"
 	override val withoutAjax = true
 
+	// The reader page carries a ubiquitous `<p class="tooltip login-required">`
+	// tooltip on its bookmark/comment buttons. The Madara default treats any
+	// `.login-required` element as a hard content block and throws
+	// AuthRequiredException ("needs to connect") before parsing the images,
+	// so narrow the check to the real block marker only.
+	override val selectRequiredLogin = ".content-blocked"
+
 	override fun getRequestHeaders() = super.getRequestHeaders().newBuilder()
 		.set("Referer", "https://www.zinmanga.net/")
 		.build()
