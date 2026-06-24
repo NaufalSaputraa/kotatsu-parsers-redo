@@ -8,6 +8,7 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.koitharu.kotatsu.parsers.MangaLoaderContext
 import org.koitharu.kotatsu.parsers.MangaSourceParser
@@ -165,25 +166,37 @@ internal class Comix(context: MangaLoaderContext) :
     }
 
     /**
-     * Returns the manga items the `/browse` page exposes. Fast path reads the
-     * server-rendered `script#initial-data` from a plain GET; if that's absent
-     * (Cloudflare interstitial, or a route that didn't pre-render), a WebView
-     * loads the page so it fetches and decrypts the API for itself, and we
-     * capture the payload it parses.
+     * Returns the manga items the `/browse` page exposes, read from the
+     * server-rendered `script#initial-data` JSON.
      */
     private suspend fun loadBrowseItems(browseUrl: String): JSONArray {
-        runCatching { webClient.httpGet(browseUrl).parseHtml() }
-            .getOrNull()
-            ?.let { extractInitialDataItems(it) }
-            ?.let { return it }
+        val document = loadRenderedDocument(browseUrl) { extractInitialDataItems(it) != null }
+            ?: throw ParseException("Comix browse page returned no results", browseUrl)
+        return extractInitialDataItems(document)
+            ?: throw ParseException("Comix browse page returned no results", browseUrl)
+    }
 
-        val response = evaluateWebViewApiJson(
-            pageUrl = browseUrl,
-            script = BROWSE_CAPTURE_SCRIPT,
-        )
-        return response.optJSONObject("result")?.optJSONArray("items")
-            ?: response.optJSONArray("items")
-            ?: JSONArray()
+    /**
+     * Loads a page and returns its rendered HTML as a [Document], retrying so a
+     * cold Cloudflare challenge can clear. A plain GET is tried first (it works
+     * once the CF cookie is in the shared client); otherwise a WebView drives
+     * the navigation, which both passes the challenge and renders the SSR HTML.
+     * [isReady] decides whether a candidate document actually carries the data
+     * we need (vs. a challenge/empty shell), so we keep retrying until it does.
+     */
+    private suspend fun loadRenderedDocument(url: String, isReady: (Document) -> Boolean): Document? {
+        repeat(WEBVIEW_PAGE_ATTEMPTS) {
+            runCatching { webClient.httpGet(url).parseHtml() }
+                .getOrNull()
+                ?.takeIf(isReady)
+                ?.let { return it }
+
+            val html = context.evaluateJs(url, PAGE_HTML_SCRIPT, WEBVIEW_PAGE_TIMEOUT)
+            if (!html.isNullOrBlank()) {
+                Jsoup.parse(html, url).takeIf(isReady)?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun extractInitialDataItems(document: Document): JSONArray? {
@@ -243,8 +256,9 @@ internal class Comix(context: MangaLoaderContext) :
         // the website hydrates from), so no signed API call is needed. If the
         // page is gated/empty, fall back to the listing-derived manga (which
         // already carries synopsis/tags/authors) so details still open.
-        val updatedManga = runCatching { webClient.httpGet(manga.url.toAbsoluteUrl(domain)).parseHtml() }
-            .getOrNull()
+        val updatedManga = loadRenderedDocument(manga.url.toAbsoluteUrl(domain)) {
+            extractInitialDataDetail(it) != null
+        }
             ?.let { extractInitialDataDetail(it) }
             ?.let { parseMangaFromJson(it) }
             ?: manga
@@ -941,51 +955,32 @@ internal class Comix(context: MangaLoaderContext) :
         private const val CLOUDFLARE_MESSAGE =
             "Cloudflare verification is required. Open Comix in the in-app browser, complete the check, then try again."
 
-        // WebView fallback for the browse page: read the SSR `script#initial-data`
-        // once the page hydrates, and as a backstop capture any decrypted API
-        // payload the app parses (`{ result: { items: [...] } }`). Returns the
-        // payload as a JSON string for the bridge to hand back.
-        private const val BROWSE_CAPTURE_SCRIPT = """
-            (async () => {
-                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-                const origParse = JSON.parse;
-                let captured = null;
-                const pickFromQueries = (queries) => {
-                    if (!queries) return null;
-                    for (const k in queries) {
-                        const v = queries[k];
-                        const items = (v && v.result && v.result.items) || (v && v.items);
-                        if (Array.isArray(items) && items.length > 0) {
-                            return JSON.stringify(v && v.result ? v : { result: v });
-                        }
-                    }
-                    return null;
+        private const val WEBVIEW_PAGE_ATTEMPTS = 3
+        private const val WEBVIEW_PAGE_TIMEOUT = 20000L
+
+        // Drives a WebView navigation past Cloudflare and returns the rendered
+        // HTML. Resolves as soon as the SSR `script#initial-data` is present
+        // (so we don't wait on the full `load` when the data is already there),
+        // otherwise after a short cap — the caller decides if the document is
+        // usable and retries the navigation if not.
+        private const val PAGE_HTML_SCRIPT = """
+            (() => new Promise((resolve) => {
+                const finish = () => resolve(
+                    document.documentElement ? document.documentElement.outerHTML : ""
+                );
+                const hasData = () => {
+                    const node = document.querySelector('script#initial-data');
+                    return !!(node && node.textContent && node.textContent.length > 50);
                 };
-                JSON.parse = new Proxy(origParse, {
-                    apply(target, thisArg, args) {
-                        const parsed = Reflect.apply(target, thisArg, args);
-                        try {
-                            const items = parsed && parsed.result && parsed.result.items;
-                            if (!captured && Array.isArray(items) && items.length > 0) {
-                                captured = JSON.stringify(parsed);
-                            }
-                        } catch (e) {}
-                        return parsed;
-                    }
-                });
-                for (let i = 0; i < 120; i++) {
-                    if (captured) return captured;
-                    try {
-                        const node = document.querySelector('script#initial-data');
-                        if (node && node.textContent) {
-                            const got = pickFromQueries(origParse(node.textContent).queries);
-                            if (got) return got;
-                        }
-                    } catch (e) {}
-                    await sleep(250);
-                }
-                return JSON.stringify({ error: 'no browse data captured' });
-            })()
+                let waited = 0;
+                const tick = () => {
+                    if (hasData()) { finish(); return; }
+                    waited += 250;
+                    if (waited >= 12000) { finish(); return; }
+                    setTimeout(tick, 250);
+                };
+                tick();
+            }))()
         """
     }
 }
