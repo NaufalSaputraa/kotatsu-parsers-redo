@@ -141,11 +141,10 @@ internal class MangaCloud(context: MangaLoaderContext) :
 			when (order) {
 				SortOrder.NEWEST -> put("sort", "created_date-DESC")
 				SortOrder.ALPHABETICAL -> put("sort", "title-ASC")
-				SortOrder.UPDATED -> put("sort", "updated_date-DESC")
+				SortOrder.UPDATED -> put("sort", "chapter_date-DESC")
 				else -> {} // POPULARITY / RELEVANCE use the default order
 			}
-			// Page 1 sends no "page" field
-			if (page > 1) put("page", page)
+			put("page", page)
 		}
 
 		val response = postApi("$apiUrl/comic/library", jsonBody).parseJson()
