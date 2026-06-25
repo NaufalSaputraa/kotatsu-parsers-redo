@@ -10,16 +10,17 @@ import org.koitharu.kotatsu.parsers.util.*
 import java.text.SimpleDateFormat
 import java.util.*
 
-@MangaSourceParser("DOUJINDESU", "DoujinDesu.tv", "id")
+@MangaSourceParser("DOUJINDESU", "DoujinDesu", "id")
 internal class DoujinDesuParser(context: MangaLoaderContext) :
 	PagedMangaParser(context, MangaParserSource.DOUJINDESU, pageSize = 18) {
 
 	override val configKeyDomain: ConfigKey.Domain
-		get() = ConfigKey.Domain("doujin.desu.xxx")
+		get() = ConfigKey.Domain("doujin.desu.xxx", "doujindesu.xxx", "doujindesu.tv")
 
 	override fun onCreateConfig(keys: MutableCollection<ConfigKey<*>>) {
 		super.onCreateConfig(keys)
 		keys.add(userAgentKey)
+		keys.add(ConfigKey.InterceptCloudflare(defaultValue = true))
 	}
 
 	override val availableSortOrders: Set<SortOrder>
